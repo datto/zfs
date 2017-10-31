@@ -46,7 +46,14 @@ static kmem_cache_t *ddt_entry_cache;
  */
 int zfs_dedup_prefetch = 0;
 
+/*
+ * Maximum number of unique (refcount==1) entries allowed in the DDT.
+ * If more entries are added, old (randomly selected) entries will be evicted.
+ */
+int64_t ddt_unique_max = 50;
+
 static const ddt_ops_t *ddt_ops[DDT_TYPES] = {
+	&ddt_log_ops,
 	&ddt_zap_ops,
 };
 
@@ -55,6 +62,9 @@ static const char *ddt_class_name[DDT_CLASSES] = {
 	"duplicate",
 	"unique",
 };
+
+/* In-core size of all DDTs */
+uint64_t zfs_ddts_msize = 0;
 
 static void
 ddt_object_create(ddt_t *ddt, enum ddt_type type, enum ddt_class class,
@@ -217,6 +227,9 @@ ddt_object_walk(ddt_t *ddt, enum ddt_type type, enum ddt_class class,
     uint64_t *walk, ddt_entry_t *dde)
 {
 	ASSERT(ddt_object_exists(ddt, type, class));
+
+	dde->dde_type = type;
+	dde->dde_class = class;
 
 	return (ddt_ops[type]->ddt_op_walk(ddt->ddt_os,
 	    ddt->ddt_object[type][class], dde, walk));
@@ -425,7 +438,7 @@ ddt_stat_add(ddt_stat_t *dst, const ddt_stat_t *src, uint64_t neg)
 		*d++ += (*s++ ^ neg) - neg;
 }
 
-static void
+void
 ddt_stat_update(ddt_t *ddt, ddt_entry_t *dde, uint64_t neg)
 {
 	ddt_stat_t dds;
@@ -758,17 +771,22 @@ ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add)
 
 	ddt_key_fill(&dde_search.dde_key, bp);
 
+	/* Do we have the dirty DDE in mem already? */
 	dde = avl_find(&ddt->ddt_tree, &dde_search, &where);
 	if (dde == NULL) {
+		/* This DDE doesn't exists in dirty tree */
 		if (!add)
 			return (NULL);
+		/* Since a dirty DDE didn't exist, create it */
 		dde = ddt_alloc(&dde_search.dde_key);
 		avl_insert(&ddt->ddt_tree, dde, where);
 	}
 
+	/* If we're already lookuing up this DDE wait untill we have it */
 	while (dde->dde_loading)
 		cv_wait(&dde->dde_cv, &ddt->ddt_lock);
 
+	/* Return the loaded DDE */
 	if (dde->dde_loaded)
 		return (dde);
 
@@ -904,6 +922,22 @@ ddt_create(spa_t *spa)
 		spa->spa_ddt[c] = ddt_table_alloc(spa, c);
 }
 
+/*
+ * Get the combined size of DDTs on all pools.
+ * Returns either on disk (phys == B_TRUE) or in core combined DDTs size
+ */
+uint64_t
+ddt_get_ddts_size(boolean_t phys)
+{
+	uint64_t ddts_size = 0;
+	spa_t *spa = NULL;
+
+	while ((spa = spa_next(spa)) != NULL)
+		ddts_size += spa_get_ddts_size(spa, phys);
+
+	return (ddts_size);
+}
+
 int
 ddt_load(spa_t *spa)
 {
@@ -911,6 +945,7 @@ ddt_load(spa_t *spa)
 	enum ddt_type type;
 	enum ddt_class class;
 	int error;
+	ddt_object_t *ddo;
 
 	ddt_create(spa);
 
@@ -927,8 +962,15 @@ ddt_load(spa_t *spa)
 			for (class = 0; class < DDT_CLASSES;
 			    class++) {
 				error = ddt_object_load(ddt, type, class);
-				if (error != 0 && error != ENOENT)
+				if (error == ENOENT)
+					continue;
+				if (error != 0)
 					return (error);
+				ddo = &ddt->ddt_object_stats[type][class];
+				atomic_add_64(&spa->spa_ddt_dsize,
+				    ddo->ddo_dspace);
+				atomic_add_64(&spa->spa_ddt_msize,
+				    ddo->ddo_mspace);
 			}
 		}
 
@@ -939,6 +981,7 @@ ddt_load(spa_t *spa)
 		    sizeof (ddt->ddt_histogram));
 		spa->spa_dedup_dspace = ~0ULL;
 	}
+	zfs_ddts_msize = ddt_get_ddts_size(B_FALSE);
 
 	return (0);
 }
@@ -954,6 +997,10 @@ ddt_unload(spa_t *spa)
 			spa->spa_ddt[c] = NULL;
 		}
 	}
+
+	spa->spa_ddt_dsize = 0;
+	spa->spa_ddt_msize = 0;
+	zfs_ddts_msize = ddt_get_ddts_size(B_FALSE);
 }
 
 boolean_t
@@ -1136,9 +1183,33 @@ ddt_sync_entry(ddt_t *ddt, ddt_entry_t *dde, dmu_tx_t *tx, uint64_t txg)
 
 	if (otype != DDT_TYPES &&
 	    (otype != ntype || oclass != nclass || total_refcnt == 0)) {
+		/*
+		 * Note: if we could evict entries from the (UNIQUE) DDT
+		 * while there are outstanding changes (ddt_entry_t's in
+		 * ddt_tree), this remove could fail because it could have
+		 * been evicted.
+		 */
 		VERIFY(ddt_object_remove(ddt, otype, oclass, dde, tx) == 0);
 		ASSERT(ddt_object_lookup(ddt, otype, oclass, dde) == ENOENT);
 	}
+	dprintf("ddt_sync_entry(txg=%llu): writing oclass=%u nclass=%u: ",
+	    (long long)txg,
+	    oclass, nclass);
+	for (int p = 0; p < DDT_PHYS_TYPES; p++) {
+		if (dde->dde_phys[p].ddp_phys_birth == 0)
+			continue;
+		dprintf("phys_type=%u rc=%llu phys_birth=%llu vd0=%llu off0=0x%llx vd1=%llu off1=0x%llx vd2=%llu off2=0x%llx; \n",
+		    p,
+		    (long long)dde->dde_phys[p].ddp_refcnt,
+		    (long long)dde->dde_phys[p].ddp_phys_birth,
+		    (long long)DVA_GET_VDEV(&dde->dde_phys[p].ddp_dva[0]),
+		    (long long)DVA_GET_OFFSET(&dde->dde_phys[p].ddp_dva[0]),
+		    (long long)DVA_GET_VDEV(&dde->dde_phys[p].ddp_dva[1]),
+		    (long long)DVA_GET_OFFSET(&dde->dde_phys[p].ddp_dva[1]),
+		    (long long)DVA_GET_VDEV(&dde->dde_phys[p].ddp_dva[2]),
+		    (long long)DVA_GET_OFFSET(&dde->dde_phys[p].ddp_dva[2]));
+	}
+	dprintf("\n");
 
 	if (total_refcnt != 0) {
 		dde->dde_type = ntype;
@@ -1165,11 +1236,14 @@ ddt_sync_entry(ddt_t *ddt, ddt_entry_t *dde, dmu_tx_t *tx, uint64_t txg)
 static void
 ddt_sync_table(ddt_t *ddt, dmu_tx_t *tx, uint64_t txg)
 {
+	uint64_t num_dbytes = 0, num_mbytes = 0;
+	int64_t old_mbytes = 0;
 	spa_t *spa = ddt->ddt_spa;
 	ddt_entry_t *dde;
 	void *cookie = NULL;
 	enum ddt_type type;
 	enum ddt_class class;
+	ddt_object_t *ddo;
 
 	if (avl_numnodes(&ddt->ddt_tree) == 0)
 		return;
@@ -1187,21 +1261,81 @@ ddt_sync_table(ddt_t *ddt, dmu_tx_t *tx, uint64_t txg)
 		ddt_free(dde);
 	}
 
+	/*
+	 * If the dedup table is too big, evict entries.
+	 *
+	 * XXX do this based on total DDT size?  Probably need controls
+	 * like try to not let the total DDT size be more than X MB,
+	 * but let UNIQUE use at least Y MB.
+	 */
+	if (ddt_object_exists(ddt, DDT_TYPE_CURRENT, DDT_CLASS_UNIQUE)) {
+		uint64_t count;
+		VERIFY0(ddt_object_count(ddt, DDT_TYPE_CURRENT,
+		    DDT_CLASS_UNIQUE, &count));
+		for (int64_t i = 0; i < (int64_t)(count - ddt_unique_max); i++) {
+			ddt_entry_t rmdde = { 0 };
+			uint64_t walk = spa_get_random(UINT64_MAX);
+			if (ddt_object_walk(ddt,
+			    DDT_TYPE_CURRENT, DDT_CLASS_UNIQUE,
+			    &walk, &rmdde) == 0) {
+				enum ddt_phys_type t;
+				for (t = 0; t < DDT_PHYS_TYPES; t++) {
+					if (rmdde.dde_phys[t].ddp_refcnt != 0)
+						break;
+				}
+				dprintf("ddt_sync_table(txg=%llu): evicting %p "
+				    "type=%u vd0=%llu off0=0x%llx vd1=%llu "
+				    "off1=0x%llx vd2=%llu off2=0x%llx\n",
+				    (long long)txg, &rmdde, t,
+				    (long long)DVA_GET_VDEV(&rmdde.dde_phys[t].ddp_dva[0]),
+				    (long long)DVA_GET_OFFSET(&rmdde.dde_phys[t].ddp_dva[0]),
+				    (long long)DVA_GET_VDEV(&rmdde.dde_phys[t].ddp_dva[1]),
+				    (long long)DVA_GET_OFFSET(&rmdde.dde_phys[t].ddp_dva[1]),
+				    (long long)DVA_GET_VDEV(&rmdde.dde_phys[t].ddp_dva[2]),
+				    (long long)DVA_GET_OFFSET(&rmdde.dde_phys[t].ddp_dva[2]));
+				ASSERT3U(ddt_phys_total_refcnt(&rmdde), ==, 1);
+				ASSERT3U(t, >, DDT_PHYS_DITTO);
+				ASSERT(rmdde.dde_phys[t].ddp_phys_birth != 0);
+				ASSERT3U(rmdde.dde_phys[t].ddp_refcnt, ==, 1);
+				for (enum ddt_phys_type u = 0; u < DDT_PHYS_TYPES; u++) {
+					if (u != t) {
+						ASSERT0(rmdde.dde_phys[u].ddp_phys_birth);
+						ASSERT0(rmdde.dde_phys[u].ddp_refcnt);
+					}
+				}
+				ddt_stat_update(ddt, &rmdde, -1);
+				VERIFY0(ddt_object_remove(ddt,
+				    DDT_TYPE_CURRENT, DDT_CLASS_UNIQUE,
+				    &rmdde, tx));
+			}
+		}
+	}
+
+
 	for (type = 0; type < DDT_TYPES; type++) {
-		uint64_t add, count = 0;
+		uint64_t add;
 		for (class = 0; class < DDT_CLASSES; class++) {
 			if (ddt_object_exists(ddt, type, class)) {
+				ddo = &ddt->ddt_object_stats[type][class];
+				old_mbytes += ddo->ddo_mspace;
 				ddt_object_sync(ddt, type, class, tx);
 				VERIFY(ddt_object_count(ddt, type, class,
 				    &add) == 0);
-				count += add;
+				if (add == 0) {
+					ddt_object_destroy(ddt, type, class,
+					    tx);
+					continue;
+				}
+
+				num_dbytes += ddo->ddo_dspace;
+				num_mbytes += ddo->ddo_mspace;
 			}
 		}
-		for (class = 0; class < DDT_CLASSES; class++) {
-			if (count == 0 && ddt_object_exists(ddt, type, class))
-				ddt_object_destroy(ddt, type, class, tx);
-		}
 	}
+
+	spa->spa_ddt_dsize = num_dbytes;
+	spa->spa_ddt_msize = num_mbytes;
+	atomic_add_64(&zfs_ddts_msize, ((int64_t)num_mbytes) - old_mbytes);
 
 	bcopy(ddt->ddt_histogram, &ddt->ddt_histogram_cache,
 	    sizeof (ddt->ddt_histogram));
@@ -1247,8 +1381,6 @@ ddt_walk(spa_t *spa, ddt_bookmark_t *ddb, ddt_entry_t *dde)
 					    ddb->ddb_type, ddb->ddb_class,
 					    &ddb->ddb_cursor, dde);
 				}
-				dde->dde_type = ddb->ddb_type;
-				dde->dde_class = ddb->ddb_class;
 				if (error == 0)
 					return (0);
 				if (error != ENOENT)

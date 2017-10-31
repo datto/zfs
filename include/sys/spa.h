@@ -819,6 +819,9 @@ extern void spa_config_update(spa_t *spa, int what);
  * Miscellaneous SPA routines in spa_misc.c
  */
 
+/* DDT size retrieval */
+extern uint64_t spa_get_ddts_size(spa_t *spa, boolean_t phys);
+
 /* Namespace manipulation */
 extern spa_t *spa_lookup(const char *name);
 extern spa_t *spa_add(const char *name, nvlist_t *config, const char *altroot);

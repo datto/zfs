@@ -42,7 +42,8 @@ struct abd;
  * On-disk DDT formats, in the desired search order (newest version first).
  */
 enum ddt_type {
-	DDT_TYPE_ZAP = 0,
+	DDT_TYPE_LOG,
+	DDT_TYPE_ZAP,
 	DDT_TYPES
 };
 
@@ -56,7 +57,7 @@ enum ddt_class {
 	DDT_CLASSES
 };
 
-#define	DDT_TYPE_CURRENT		0
+#define	DDT_TYPE_CURRENT		DDT_TYPE_ZAP
 
 #define	DDT_COMPRESS_BYTEORDER_MASK	0x80
 #define	DDT_COMPRESS_FUNCTION_MASK	0x7f
@@ -212,6 +213,7 @@ extern boolean_t ddt_histogram_empty(const ddt_histogram_t *ddh);
 extern void ddt_get_dedup_object_stats(spa_t *spa, ddt_object_t *ddo);
 extern void ddt_get_dedup_histogram(spa_t *spa, ddt_histogram_t *ddh);
 extern void ddt_get_dedup_stats(spa_t *spa, ddt_stat_t *dds_total);
+extern void ddt_stat_update(ddt_t *ddt, ddt_entry_t *dde, uint64_t neg);
 
 extern uint64_t ddt_get_dedup_dspace(spa_t *spa);
 extern uint64_t ddt_get_pool_dedup_ratio(spa_t *spa);
@@ -249,6 +251,7 @@ extern int ddt_object_update(ddt_t *ddt, enum ddt_type type,
     enum ddt_class class, ddt_entry_t *dde, dmu_tx_t *tx);
 
 extern const ddt_ops_t ddt_zap_ops;
+extern const ddt_ops_t ddt_log_ops;
 
 #ifdef	__cplusplus
 }

@@ -45,6 +45,7 @@ KERNEL_C = \
 	dbuf_stats.c \
 	ddt.c \
 	ddt_zap.c \
+	ddt_log.c \
 	dmu.c \
 	dmu_diff.c \
 	dmu_object.c \

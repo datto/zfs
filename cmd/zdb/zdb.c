@@ -981,16 +981,19 @@ dump_ddt(ddt_t *ddt, enum ddt_type type, enum ddt_class class)
 	if (count == 0)
 		return;
 
-	dspace = doi.doi_physical_blocks_512 << 9;
-	mspace = doi.doi_fill_count * doi.doi_data_block_size;
+	dspace = (doi.doi_physical_blocks_512 << 9) / count;
+	mspace = (doi.doi_fill_count * doi.doi_data_block_size) / count;
+	if (type == DDT_TYPE_LOG)
+		mspace = 320; /* XXX sizeof ddt_tree_entry_t */
 
 	ddt_object_name(ddt, type, class, name);
 
-	(void) printf("%s: %llu entries, size %llu on disk, %llu in core\n",
+	(void) printf("%s: %llu entries, "
+	    "avg size %lluB on disk, %lluB in core\n",
 	    name,
 	    (u_longlong_t)count,
-	    (u_longlong_t)(dspace / count),
-	    (u_longlong_t)(mspace / count));
+	    (u_longlong_t)dspace,
+	    (u_longlong_t)mspace);
 
 	if (dump_opt['D'] < 3)
 		return;
@@ -3024,10 +3027,12 @@ zdb_count_block(zdb_cb_t *zcb, zilog_t *zilog, const blkptr_t *bp,
 			refcnt = 0;
 		} else {
 			ddt_phys_t *ddp = ddt_phys_select(dde, bp);
-			ddt_phys_decref(ddp);
-			refcnt = ddp->ddp_refcnt;
-			if (ddt_phys_total_refcnt(dde) == 0)
-				ddt_remove(ddt, dde);
+			if (ddp != NULL) {
+				ddt_phys_decref(ddp);
+				refcnt = ddp->ddp_refcnt;
+				if (ddt_phys_total_refcnt(dde) == 0)
+					ddt_remove(ddt, dde);
+			}
 		}
 		ddt_exit(ddt);
 	}
@@ -3187,10 +3192,12 @@ zdb_ddt_leak_init(spa_t *spa, zdb_cb_t *zcb)
 		blkptr_t blk;
 		ddt_phys_t *ddp = dde.dde_phys;
 
+#if 0
 		if (ddb.ddb_class == DDT_CLASS_UNIQUE)
 			return;
+#endif
 
-		ASSERT(ddt_phys_total_refcnt(&dde) > 1);
+		ASSERT(ddt_phys_total_refcnt(&dde) > 0);
 
 		for (p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
 			if (ddp->ddp_phys_birth == 0)
@@ -3214,6 +3221,46 @@ zdb_ddt_leak_init(spa_t *spa, zdb_cb_t *zcb)
 	}
 
 	ASSERT(error == ENOENT);
+}
+
+static boolean_t
+zdb_ddt_leak_fini(spa_t *spa)
+{
+	boolean_t rv = B_FALSE;
+
+	if (dump_opt['L'])
+		return (rv);
+
+	for (enum zio_checksum c = 0; c < ZIO_CHECKSUM_FUNCTIONS; c++) {
+		ddt_t *ddt = spa->spa_ddt[c];
+
+		if (ddt == NULL)
+			continue;
+
+		for (ddt_entry_t *dde = avl_first(&ddt->ddt_tree); dde != NULL;
+		    dde = AVL_NEXT(&ddt->ddt_tree, dde)) {
+			ddt_phys_t *ddp = dde->dde_phys;
+			rv = B_TRUE;
+			(void) printf("leaked DDT refcount %llu:\n",
+			    (long long)ddt_phys_total_refcnt(dde));
+
+			for (int p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
+				if (ddp->ddp_phys_birth == 0)
+					continue;
+
+				blkptr_t bp;
+				ddt_bp_create(c, &dde->dde_key, ddp, &bp);
+
+				char blkbuf[BP_SPRINTF_LEN];
+				snprintf_blkptr(blkbuf, sizeof (blkbuf), &bp);
+
+				printf("    %s\n", blkbuf);
+			}
+		}
+	}
+	if (!rv)
+		(void) printf("DDT refcounts verified\n");
+	return (rv);
 }
 
 static void
@@ -3318,6 +3365,7 @@ zdb_leak_fini(spa_t *spa)
 				mutex_exit(&msp->ms_lock);
 			}
 		}
+		(void) zdb_ddt_leak_fini(spa);
 	}
 }
 

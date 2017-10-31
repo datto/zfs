@@ -1662,6 +1662,18 @@ spa_get_worst_case_asize(spa_t *spa, uint64_t lsize)
 }
 
 /*
+ * Get either on disk (phys == B_TRUE) or possible in core DDT size
+ */
+uint64_t
+spa_get_ddts_size(spa_t *spa, boolean_t phys)
+{
+	if (phys)
+		return (spa->spa_ddt_dsize);
+
+	return (spa->spa_ddt_msize);
+}
+
+/*
  * Return the amount of slop space in bytes.  It is 1/32 of the pool (3.2%),
  * or at least 128MB, unless that would cause it to be more than half the
  * pool size.

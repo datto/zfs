@@ -18,6 +18,7 @@ $(MODULE)-objs += bptree.o
 $(MODULE)-objs += bqueue.o
 $(MODULE)-objs += ddt.o
 $(MODULE)-objs += ddt_zap.o
+$(MODULE)-objs += ddt_log.o
 $(MODULE)-objs += dmu.o
 $(MODULE)-objs += dmu_diff.o
 $(MODULE)-objs += dmu_object.o
