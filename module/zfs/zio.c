@@ -401,6 +401,7 @@ zio_decrypt(zio_t *zio, abd_t *data, uint64_t size)
 	int ret;
 	void *tmp;
 	blkptr_t *bp = zio->io_bp;
+	spa_t *spa = zio->io_spa;
 	uint64_t lsize = BP_GET_LSIZE(bp);
 	dmu_object_type_t ot = BP_GET_TYPE(bp);
 	uint8_t salt[ZIO_DATA_SALT_LEN];
@@ -459,12 +460,12 @@ zio_decrypt(zio_t *zio, abd_t *data, uint64_t size)
 	 */
 	if (BP_IS_AUTHENTICATED(bp)) {
 		if (ot == DMU_OT_OBJSET) {
-			ret = spa_do_crypt_objset_mac_abd(B_FALSE, zio->io_spa,
+			ret = spa_do_crypt_objset_mac_abd(B_FALSE, spa,
 			    zio->io_bookmark.zb_objset, zio->io_abd, size,
 			    BP_SHOULD_BYTESWAP(bp));
 		} else {
 			zio_crypt_decode_mac_bp(bp, mac);
-			ret = spa_do_crypt_mac_abd(B_FALSE, zio->io_spa,
+			ret = spa_do_crypt_mac_abd(B_FALSE, spa,
 			    zio->io_bookmark.zb_objset, zio->io_abd, size, mac);
 		}
 		abd_copy(data, zio->io_abd, size);
@@ -485,7 +486,7 @@ zio_decrypt(zio_t *zio, abd_t *data, uint64_t size)
 		zio_crypt_decode_mac_bp(bp, mac);
 	}
 
-	ret = spa_do_crypt_abd(B_FALSE, zio->io_spa, zio->io_bookmark.zb_objset,
+	ret = spa_do_crypt_abd(B_FALSE, spa, zio->io_bookmark.zb_objset,
 	    bp, bp->blk_birth, size, data, zio->io_abd, iv, mac, salt,
 	    &no_crypt);
 	if (no_crypt)
@@ -508,8 +509,16 @@ error:
 		ret = SET_ERROR(EIO);
 		if ((zio->io_flags & ZIO_FLAG_SPECULATIVE) == 0) {
 			zfs_ereport_post(FM_EREPORT_ZFS_AUTHENTICATION,
-			    zio->io_spa, NULL, &zio->io_bookmark, zio, 0, 0);
+			    spa, NULL, &zio->io_bookmark, zio, 0, 0);
 		}
+
+		/*
+		 * If this is a protected, indirect bp with a correct checksum
+		 * but a bad checksum-of-MACs we have found evidence of #6845
+		 * and we must report the errata.
+		 */
+		if (BP_HAS_INDIRECT_MAC_CKSUM(bp))
+			spa->spa_errata = ZPOOL_ERRATA_ZOL_6845_ENCRYPTION;
 	} else {
 		zio->io_error = ret;
 	}

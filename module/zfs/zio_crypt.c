@@ -844,8 +844,10 @@ zio_crypt_copy_dnode_bonus(abd_t *src_abd, uint8_t *dst, uint_t datalen)
 static void
 zio_crypt_bp_zero_nonportable_blkprop(blkptr_t *bp)
 {
+	BP_SET_BYTEORDER(bp, 0);
 	BP_SET_DEDUP(bp, 0);
 	BP_SET_CHECKSUM(bp, 0);
+	BP_SET_COMPRESS(bp, 0);
 
 	/*
 	 * psize cannot be set to zero or it will trigger asserts, but the
