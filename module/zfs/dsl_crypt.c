@@ -1882,7 +1882,7 @@ dsl_crypto_recv_key_check(void *arg, dmu_tx_t *tx)
 	dsl_dataset_t *ds = NULL;
 	uint8_t *buf = NULL;
 	uint_t len;
-	uint64_t intval, guid, nlevels, blksz, ibs, nblkptr;
+	uint64_t intval, guid, nlevels, blksz, ibs, nblkptr, maxblkid;
 	boolean_t is_passphrase = B_FALSE;
 
 	ret = dsl_dataset_hold_obj(tx->tx_pool, dcrka->dcrka_dsobj, FTAG, &ds);
@@ -2027,6 +2027,12 @@ dsl_crypto_recv_key_check(void *arg, dmu_tx_t *tx)
 		goto error;
 	}
 
+	ret = nvlist_lookup_uint64(nvl, "mdn_maxblkid", &maxblkid);
+	if (ret != 0) {
+		ret = SET_ERROR(EINVAL);
+		goto error;
+	}
+
 	ret = dmu_objset_from_ds(ds, &os);
 	if (ret != 0)
 		goto error;
@@ -2078,7 +2084,7 @@ dsl_crypto_recv_key_sync(void *arg, dmu_tx_t *tx)
 	uint_t len;
 	uint64_t rddobj, one = 1;
 	uint64_t crypt, guid, keyformat, iters, salt;
-	uint64_t compress, checksum, nlevels, blksz, ibs;
+	uint64_t compress, checksum, nlevels, blksz, ibs, maxblkid;
 	char *keylocation = "prompt";
 
 	VERIFY0(dsl_dataset_hold_obj(dp, dsobj, FTAG, &ds));
@@ -2107,6 +2113,7 @@ dsl_crypto_recv_key_sync(void *arg, dmu_tx_t *tx)
 	nlevels = fnvlist_lookup_uint64(nvl, "mdn_nlevels");
 	blksz = fnvlist_lookup_uint64(nvl, "mdn_blksz");
 	ibs = fnvlist_lookup_uint64(nvl, "mdn_indblkshift");
+	maxblkid = fnvlist_lookup_uint64(nvl, "mdn_maxblkid");
 
 	/* if we haven't created an objset for the ds yet, do that now */
 	rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
@@ -2131,6 +2138,7 @@ dsl_crypto_recv_key_sync(void *arg, dmu_tx_t *tx)
 	/* set metadnode compression and checksum */
 	mdn->dn_compress = compress;
 	mdn->dn_checksum = checksum;
+	mdn->dn_maxblkid = maxblkid;
 	dsl_dataset_dirty(ds, tx);
 
 	/* if this is a new dataset setup the DSL Crypto Key. */
@@ -2311,6 +2319,7 @@ dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
 	fnvlist_add_uint64(nvl, "mdn_blksz", mdn->dn_datablksz);
 	fnvlist_add_uint64(nvl, "mdn_indblkshift", mdn->dn_indblkshift);
 	fnvlist_add_uint64(nvl, "mdn_nblkptr", mdn->dn_nblkptr);
+	fnvlist_add_uint64(nvl, "mdn_maxblkid", mdn->dn_maxblkid);
 
 	*nvl_out = nvl;
 	return (0);
