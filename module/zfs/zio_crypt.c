@@ -844,6 +844,16 @@ zio_crypt_copy_dnode_bonus(abd_t *src_abd, uint8_t *dst, uint_t datalen)
 static void
 zio_crypt_bp_zero_nonportable_blkprop(blkptr_t *bp)
 {
+	/*
+	 * The hole_birth feature might set these fields even if this is bp
+	 * is a hole. We zero them out here to guarantee that raw sends will
+	 * function with or without the feature.
+	 */
+	if (BP_IS_HOLE(bp)) {
+		bp->blk_prop = 0ULL;
+		return;
+	}
+
 	BP_SET_BYTEORDER(bp, 0);
 	BP_SET_DEDUP(bp, 0);
 	BP_SET_CHECKSUM(bp, 0);
