@@ -150,8 +150,8 @@ uint32_t zfs_vdev_async_read_min_active = 1;
 uint32_t zfs_vdev_async_read_max_active = 3;
 uint32_t zfs_vdev_async_write_min_active = 2;
 uint32_t zfs_vdev_async_write_max_active = 10;
-uint32_t zfs_vdev_scrub_min_active = 1;
-uint32_t zfs_vdev_scrub_max_active = 2;
+uint32_t zfs_vdev_scrub_min_active = 16;
+uint32_t zfs_vdev_scrub_max_active = 32;
 
 /*
  * When the pool has less than zfs_vdev_async_write_active_min_dirty_percent

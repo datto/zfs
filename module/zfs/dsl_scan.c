@@ -144,7 +144,7 @@ int zfs_scan_strict_mem_lim = B_FALSE;
  * overload the drives with I/O, since that is protected by
  * zfs_vdev_scrub_max_active.
  */
-unsigned long zfs_scan_vdev_limit = 4 << 20;
+unsigned long zfs_scan_vdev_limit = 16 << 20;
 
 int zfs_scan_issue_strategy = 0;
 int zfs_scan_legacy = B_FALSE; /* don't queue & sort zios, go direct */
@@ -1342,7 +1342,7 @@ dsl_scan_check_prefetch_resume(scan_prefetch_ctx_t *spc,
 	dnode_phys_t tmp_dnp;
 	dnode_phys_t *dnp = (spc->spc_root) ? NULL : &tmp_dnp;
 
-	if (zb->zb_objset != last_zb->zb_objset)
+	if (zb->zb_objset < last_zb->zb_objset)
 		return (B_TRUE);
 	if ((int64_t)zb->zb_object < 0)
 		return (B_FALSE);
@@ -1814,7 +1814,6 @@ dsl_scan_visit_rootbp(dsl_scan_t *scn, dsl_dataset_t *ds, blkptr_t *bp,
     dmu_tx_t *tx)
 {
 	zbookmark_phys_t zb;
-	scan_prefetch_ctx_t *spc;
 
 	SET_BOOKMARK(&zb, ds ? ds->ds_object : DMU_META_OBJSET,
 	    ZB_ROOT_OBJECT, ZB_ROOT_LEVEL, ZB_ROOT_BLKID);
@@ -1827,10 +1826,6 @@ dsl_scan_visit_rootbp(dsl_scan_t *scn, dsl_dataset_t *ds, blkptr_t *bp,
 	}
 
 	scn->scn_objsets_visited_this_txg++;
-
-	spc = scan_prefetch_ctx_create(scn, NULL, FTAG);
-	dsl_scan_prefetch(spc, bp, &zb);
-	scan_prefetch_ctx_rele(spc, FTAG);
 
 	dsl_scan_visitbp(bp, &zb, NULL, ds, scn, DMU_OST_NONE, tx);
 
@@ -2403,8 +2398,13 @@ dsl_scan_ds_maxtxg(dsl_dataset_t *ds)
 static void
 dsl_scan_visit(dsl_scan_t *scn, dmu_tx_t *tx)
 {
+	int i;
+	zbookmark_phys_t zb;
 	scan_ds_t *sds;
+	scan_prefetch_ctx_t *spc;
+	dsl_dataset_t *ds;
 	dsl_pool_t *dp = scn->scn_dp;
+	uint64_t dsobj, to_prefetch = scn->scn_objsets_visited_last_txg;
 
 	if (scn->scn_phys.scn_ddt_bookmark.ddb_class <=
 	    scn->scn_phys.scn_ddt_class_max) {
@@ -2413,6 +2413,50 @@ dsl_scan_visit(dsl_scan_t *scn, dmu_tx_t *tx)
 		dsl_scan_ddt(scn, tx);
 		if (scn->scn_suspending)
 			return;
+	}
+
+	/*
+	 * Predict how many datasets we need to start prefetching based on
+	 * the number of datasets we scanned last txg. If we underestimate
+	 * here we will prefetch additional datasets when we get to them.
+	 */
+	if (scn->scn_phys.scn_bookmark.zb_objset == DMU_META_OBJSET) {
+		/* We are scanning the MOS. Don't attempt to prefetch ahead. */
+		to_prefetch = 0;
+		SET_BOOKMARK(&zb, DMU_META_OBJSET, ZB_ROOT_OBJECT,
+		    ZB_ROOT_LEVEL, ZB_ROOT_BLKID);
+		spc = scan_prefetch_ctx_create(scn, NULL, FTAG);
+		dsl_scan_prefetch(spc, &dp->dp_meta_rootbp, &zb);
+		scan_prefetch_ctx_rele(spc, FTAG);
+	} else if (scn->scn_phys.scn_bookmark.zb_objset !=
+	    ZB_DESTROYED_OBJSET) {
+		/* We were suspended. Pickup prefetch where we left off. */
+		dsobj = scn->scn_phys.scn_bookmark.zb_objset;
+		SET_BOOKMARK(&zb, dsobj, ZB_ROOT_OBJECT, ZB_ROOT_LEVEL,
+		    ZB_ROOT_BLKID);
+		to_prefetch--;
+		VERIFY3U(0, ==, dsl_dataset_hold_obj(dp, dsobj, FTAG, &ds));
+		spc = scan_prefetch_ctx_create(scn, NULL, FTAG);
+		rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
+		dsl_scan_prefetch(spc, &dsl_dataset_phys(ds)->ds_bp, &zb);
+		rrw_exit(&ds->ds_bp_rwlock, FTAG);
+		scan_prefetch_ctx_rele(spc, FTAG);
+		dsl_dataset_rele(ds, FTAG);
+	}
+
+	for (i = 0, sds = avl_first(&scn->scn_queue);
+	    i < to_prefetch && sds != NULL;
+	    i++, sds = AVL_NEXT(&scn->scn_queue, sds)) {
+		dsobj = sds->sds_dsobj;
+		SET_BOOKMARK(&zb, dsobj, ZB_ROOT_OBJECT, ZB_ROOT_LEVEL,
+		    ZB_ROOT_BLKID);
+		VERIFY3U(0, ==, dsl_dataset_hold_obj(dp, dsobj, FTAG, &ds));
+		spc = scan_prefetch_ctx_create(scn, NULL, FTAG);
+		rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
+		dsl_scan_prefetch(spc, &dsl_dataset_phys(ds)->ds_bp, &zb);
+		rrw_exit(&ds->ds_bp_rwlock, FTAG);
+		scan_prefetch_ctx_rele(spc, FTAG);
+		dsl_dataset_rele(ds, FTAG);
 	}
 
 	if (scn->scn_phys.scn_bookmark.zb_objset == DMU_META_OBJSET) {
@@ -2436,7 +2480,7 @@ dsl_scan_visit(dsl_scan_t *scn, dmu_tx_t *tx)
 		ASSERT(!scn->scn_suspending);
 	} else if (scn->scn_phys.scn_bookmark.zb_objset !=
 	    ZB_DESTROYED_OBJSET) {
-		uint64_t dsobj = scn->scn_phys.scn_bookmark.zb_objset;
+		dsobj = scn->scn_phys.scn_bookmark.zb_objset;
 		/*
 		 * If we were suspended, continue from here. Note if the
 		 * ds we were suspended on was deleted, the zb_objset may
@@ -2458,10 +2502,11 @@ dsl_scan_visit(dsl_scan_t *scn, dmu_tx_t *tx)
 	 * Keep pulling things out of the dataset avl queue. Updates to the
 	 * persistent zap-object-as-queue happen only at checkpoints.
 	 */
+	i = 0;
 	while ((sds = avl_first(&scn->scn_queue)) != NULL) {
 		dsl_dataset_t *ds;
-		uint64_t dsobj = sds->sds_dsobj;
 		uint64_t txg = sds->sds_txg;
+		dsobj = sds->sds_dsobj;
 
 		/* dequeue and free the ds from the queue */
 		scan_ds_queue_remove(scn, dsobj);
@@ -2478,11 +2523,26 @@ dsl_scan_visit(dsl_scan_t *scn, dmu_tx_t *tx)
 			    dsl_dataset_phys(ds)->ds_prev_snap_txg);
 		}
 		scn->scn_phys.scn_cur_max_txg = dsl_scan_ds_maxtxg(ds);
+
+		/* start prefetching now if our prediction underestimated */
+		if (i > to_prefetch) {
+			SET_BOOKMARK(&zb, dsobj, ZB_ROOT_OBJECT, ZB_ROOT_LEVEL,
+			    ZB_ROOT_BLKID);
+			spc = scan_prefetch_ctx_create(scn, NULL, FTAG);
+			rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
+			dsl_scan_prefetch(spc, &dsl_dataset_phys(ds)->ds_bp,
+			    &zb);
+			rrw_exit(&ds->ds_bp_rwlock, FTAG);
+			scan_prefetch_ctx_rele(spc, FTAG);
+		}
+
 		dsl_dataset_rele(ds, FTAG);
 
 		dsl_scan_visitds(scn, dsobj, tx);
 		if (scn->scn_suspending)
 			return;
+
+		i++;
 	}
 
 	/* No more objsets to fetch, we're done */
@@ -3027,6 +3087,7 @@ dsl_scan_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 	scn->scn_lt_min_this_txg = 0;
 	scn->scn_gt_max_this_txg = 0;
 	scn->scn_ddt_contained_this_txg = 0;
+	scn->scn_objsets_visited_last_txg = scn->scn_objsets_visited_this_txg;
 	scn->scn_objsets_visited_this_txg = 0;
 	scn->scn_avg_seg_size_this_txg = 0;
 	scn->scn_segs_this_txg = 0;

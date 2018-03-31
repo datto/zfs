@@ -142,6 +142,7 @@ typedef struct dsl_scan {
 	uint64_t scn_gt_max_this_txg;
 	uint64_t scn_ddt_contained_this_txg;
 	uint64_t scn_objsets_visited_this_txg;
+	uint64_t scn_objsets_visited_last_txg; /* used for scan pre-fetch */
 	uint64_t scn_avg_seg_size_this_txg;
 	uint64_t scn_segs_this_txg;
 	uint64_t scn_avg_zio_size_this_txg;
