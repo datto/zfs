@@ -175,6 +175,11 @@ struct objset {
 	list_t os_dnodes;
 	list_t os_downgraded_dbufs;
 
+	/* eviction signaling, protected by os_ev_lock */
+	kmutex_t os_ev_lock;
+	kcondvar_t os_ev_cv;
+	uint64_t os_ev_tid;
+
 	/* Protects changes to DMU_{USER,GROUP,PROJECT}USED_OBJECT */
 	kmutex_t os_userused_lock;
 

@@ -683,6 +683,18 @@ dbuf_evict_one(void)
 	    multilist_sublist_t *, mls);
 
 	if (db != NULL) {
+		/*
+		 * Bail out if another process is already evicting
+		 * this dbuf's objset.
+		 */
+		uint64_t tid = (uint64_t)(uintptr_t)curthread;
+		objset_t *os = db->db_objset;
+		(void) atomic_cas_64(&os->os_ev_tid, 0, tid);
+		if (os->os_ev_tid != tid) {
+			multilist_sublist_unlock(mls);
+			mutex_exit(&db->db_mtx);
+			return;
+		}
 		multilist_sublist_remove(mls, db);
 		multilist_sublist_unlock(mls);
 		(void) zfs_refcount_remove_many(
@@ -697,6 +709,10 @@ dbuf_evict_one(void)
 		DBUF_STAT_MAX(cache_size_bytes_max,
 		    zfs_refcount_count(&dbuf_caches[DB_DBUF_CACHE].size));
 		DBUF_STAT_BUMP(cache_total_evicts);
+		mutex_enter(&os->os_ev_lock);
+		(void) atomic_cas_64(&os->os_ev_tid, tid, 0);
+		cv_broadcast(&os->os_ev_cv);
+		mutex_exit(&os->os_ev_lock);
 	} else {
 		multilist_sublist_unlock(mls);
 	}

@@ -1339,7 +1339,7 @@ dsl_dataset_dirty(dsl_dataset_t *ds, dmu_tx_t *tx)
 	}
 }
 
-static int
+int
 dsl_dataset_snapshot_reserve_space(dsl_dataset_t *ds, dmu_tx_t *tx)
 {
 	uint64_t asize;
@@ -1418,10 +1418,6 @@ dsl_dataset_snapshot_check_impl(dsl_dataset_t *ds, const char *snapname,
 		if (error != 0)
 			return (error);
 	}
-
-	error = dsl_dataset_snapshot_reserve_space(ds, tx);
-	if (error != 0)
-		return (error);
 
 	return (0);
 }
@@ -1564,6 +1560,40 @@ dsl_dataset_snapshot_check(void *arg, dmu_tx_t *tx)
 			}
 			rv = error;
 		}
+	}
+	if (rv != 0)
+		return (rv);
+
+	/* Now reserve space since we passed all the checks. */
+	for (pair = nvlist_next_nvpair(ddsa->ddsa_snaps, NULL);
+	    pair != NULL; pair = nvlist_next_nvpair(ddsa->ddsa_snaps, pair)) {
+		int error = 0;
+		char *name, *atp = NULL;
+		dsl_dataset_t *ds;
+		char dsname[ZFS_MAX_DATASET_NAME_LEN];
+
+		name = nvpair_name(pair);
+		atp = strchr(name, '@');
+		(void) strlcpy(dsname, name, atp - name + 1);
+		(void) dsl_dataset_hold(dp, dsname, FTAG, &ds);
+		/*
+		 * This accumulates dsl_dir_t dd_space_to_write which may
+		 * need to be undone if we get ENOSPC while reserving.
+		 */
+		error = dsl_dataset_snapshot_reserve_space(ds, tx);
+		dsl_dataset_rele(ds, FTAG);
+		if (error) {
+			rv = error;
+			break;
+		}
+	}
+	if (rv == 0)
+		return (rv);
+
+	ASSERT3U(rv, ==, ENOSPC);
+	dsl_dir_t *dd;
+	while ((dd = txg_list_remove(&dp->dp_dirty_dirs, tx->tx_txg)) != NULL) {
+		dsl_dir_sync(dd, tx);
 	}
 
 	return (rv);
@@ -1848,6 +1878,11 @@ dsl_dataset_snapshot_tmp_check(void *arg, dmu_tx_t *tx)
 	/* NULL cred means no limit check for tmp snapshot */
 	error = dsl_dataset_snapshot_check_impl(ds, ddsta->ddsta_snapname,
 	    tx, B_FALSE, 0, NULL);
+	if (error != 0) {
+		dsl_dataset_rele(ds, FTAG);
+		return (error);
+	}
+	error = dsl_dataset_snapshot_reserve_space(ds, tx);
 	if (error != 0) {
 		dsl_dataset_rele(ds, FTAG);
 		return (error);
