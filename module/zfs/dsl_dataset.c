@@ -1422,11 +1422,17 @@ dsl_dataset_snapshot_check_impl(dsl_dataset_t *ds, const char *snapname,
 	return (0);
 }
 
+struct checknode {
+    list_node_t link;
+    dsl_dataset_t *ds;
+};
+
 int
 dsl_dataset_snapshot_check(void *arg, dmu_tx_t *tx)
 {
 	dsl_dataset_snapshot_arg_t *ddsa = arg;
 	dsl_pool_t *dp = dmu_tx_pool(tx);
+	struct checknode *chknode;
 	nvpair_t *pair;
 	int rv = 0;
 
@@ -1527,6 +1533,9 @@ dsl_dataset_snapshot_check(void *arg, dmu_tx_t *tx)
 		nvlist_free(cnt_track);
 	}
 
+	list_t datasets;
+	list_create(&datasets, sizeof (struct checknode),
+	    offsetof(struct checknode, link));
 	for (pair = nvlist_next_nvpair(ddsa->ddsa_snaps, NULL);
 	    pair != NULL; pair = nvlist_next_nvpair(ddsa->ddsa_snaps, pair)) {
 		int error = 0;
@@ -1550,7 +1559,6 @@ dsl_dataset_snapshot_check(void *arg, dmu_tx_t *tx)
 			/* passing 0/NULL skips dsl_fs_ss_limit_check */
 			error = dsl_dataset_snapshot_check_impl(ds,
 			    atp + 1, tx, B_FALSE, 0, NULL);
-			dsl_dataset_rele(ds, FTAG);
 		}
 
 		if (error != 0) {
@@ -1560,33 +1568,34 @@ dsl_dataset_snapshot_check(void *arg, dmu_tx_t *tx)
 			}
 			rv = error;
 		}
+		chknode = kmem_alloc(sizeof (*chknode), KM_SLEEP);
+		chknode->ds = ds;
+		list_insert_tail(&datasets, chknode);
 	}
-	if (rv != 0)
+	if (rv != 0) {
+		while ((chknode = list_remove_head(&datasets)) != NULL) {
+			dsl_dataset_rele(chknode->ds, FTAG);
+			kmem_free(chknode, sizeof (*chknode));
+		}
+		list_destroy(&datasets);
 		return (rv);
+	}
 
 	/* Now reserve space since we passed all the checks. */
-	for (pair = nvlist_next_nvpair(ddsa->ddsa_snaps, NULL);
-	    pair != NULL; pair = nvlist_next_nvpair(ddsa->ddsa_snaps, pair)) {
+	while ((chknode = list_remove_head(&datasets)) != NULL) {
 		int error = 0;
-		char *name, *atp = NULL;
-		dsl_dataset_t *ds;
-		char dsname[ZFS_MAX_DATASET_NAME_LEN];
 
-		name = nvpair_name(pair);
-		atp = strchr(name, '@');
-		(void) strlcpy(dsname, name, atp - name + 1);
-		(void) dsl_dataset_hold(dp, dsname, FTAG, &ds);
 		/*
 		 * This accumulates dsl_dir_t dd_space_to_write which may
 		 * need to be undone if we get ENOSPC while reserving.
 		 */
-		error = dsl_dataset_snapshot_reserve_space(ds, tx);
-		dsl_dataset_rele(ds, FTAG);
-		if (error) {
+		error = dsl_dataset_snapshot_reserve_space(chknode->ds, tx);
+		dsl_dataset_rele(chknode->ds, FTAG);
+		kmem_free(chknode, sizeof (*chknode));
+		if (error)
 			rv = error;
-			break;
-		}
 	}
+	list_destroy(&datasets);
 	if (rv == 0)
 		return (rv);
 
@@ -1882,11 +1891,6 @@ dsl_dataset_snapshot_tmp_check(void *arg, dmu_tx_t *tx)
 		dsl_dataset_rele(ds, FTAG);
 		return (error);
 	}
-	error = dsl_dataset_snapshot_reserve_space(ds, tx);
-	if (error != 0) {
-		dsl_dataset_rele(ds, FTAG);
-		return (error);
-	}
 
 	if (spa_version(dp->dp_spa) < SPA_VERSION_USERREFS) {
 		dsl_dataset_rele(ds, FTAG);
@@ -1894,6 +1898,11 @@ dsl_dataset_snapshot_tmp_check(void *arg, dmu_tx_t *tx)
 	}
 	error = dsl_dataset_user_hold_check_one(NULL, ddsta->ddsta_htag,
 	    B_TRUE, tx);
+	if (error != 0) {
+		dsl_dataset_rele(ds, FTAG);
+		return (error);
+	}
+	error = dsl_dataset_snapshot_reserve_space(ds, tx);
 	if (error != 0) {
 		dsl_dataset_rele(ds, FTAG);
 		return (error);

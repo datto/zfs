@@ -328,8 +328,9 @@ dbuf_hash(void *os, uint64_t obj, uint8_t lvl, uint64_t blkid)
 	(dbuf)->db_level == (level) &&			\
 	(dbuf)->db_blkid == (blkid))
 
-dmu_buf_impl_t *
-dbuf_find(objset_t *os, uint64_t obj, uint8_t level, uint64_t blkid)
+static dmu_buf_impl_t *
+dbuf_find_impl(objset_t *os, uint64_t obj, uint8_t level, uint64_t blkid,
+    boolean_t find_evicting, dmu_buf_impl_t *db2)
 {
 	dbuf_hash_table_t *h = &dbuf_hash_table;
 	uint64_t hv;
@@ -341,17 +342,39 @@ dbuf_find(objset_t *os, uint64_t obj, uint8_t level, uint64_t blkid)
 
 	mutex_enter(DBUF_HASH_MUTEX(h, idx));
 	for (db = h->hash_table[idx]; db != NULL; db = db->db_hash_next) {
+		if (db == db2)
+			continue;
 		if (DBUF_EQUAL(db, os, obj, level, blkid)) {
-			mutex_enter(&db->db_mtx);
-			if (db->db_state != DB_EVICTING) {
+			if (!find_evicting)
+				mutex_enter(&db->db_mtx);
+			if ((db->db_state == DB_EVICTING && find_evicting) ||
+			    (db->db_state != DB_EVICTING && !find_evicting)) {
 				mutex_exit(DBUF_HASH_MUTEX(h, idx));
 				return (db);
 			}
-			mutex_exit(&db->db_mtx);
+			if (!find_evicting)
+				mutex_exit(&db->db_mtx);
 		}
 	}
 	mutex_exit(DBUF_HASH_MUTEX(h, idx));
 	return (NULL);
+}
+
+dmu_buf_impl_t *
+dbuf_find_evicting(objset_t *os, uint64_t obj, uint8_t level,
+    uint64_t blkid, dmu_buf_impl_t *db)
+{
+	/*
+	 * Pass in our current dbuf which dbuf_find will skip
+	 * in its search.
+	 */
+	return (dbuf_find_impl(os, obj, level, blkid, B_TRUE, db));
+}
+
+dmu_buf_impl_t *
+dbuf_find(objset_t *os, uint64_t obj, uint8_t level, uint64_t blkid)
+{
+	return (dbuf_find_impl(os, obj, level, blkid, B_FALSE, NULL));
 }
 
 static dmu_buf_impl_t *
@@ -683,18 +706,6 @@ dbuf_evict_one(void)
 	    multilist_sublist_t *, mls);
 
 	if (db != NULL) {
-		/*
-		 * Bail out if another process is already evicting
-		 * this dbuf's objset.
-		 */
-		uint64_t tid = (uint64_t)(uintptr_t)curthread;
-		objset_t *os = db->db_objset;
-		(void) atomic_cas_64(&os->os_ev_tid, 0, tid);
-		if (os->os_ev_tid != tid) {
-			multilist_sublist_unlock(mls);
-			mutex_exit(&db->db_mtx);
-			return;
-		}
 		multilist_sublist_remove(mls, db);
 		multilist_sublist_unlock(mls);
 		(void) zfs_refcount_remove_many(
@@ -709,10 +720,6 @@ dbuf_evict_one(void)
 		DBUF_STAT_MAX(cache_size_bytes_max,
 		    zfs_refcount_count(&dbuf_caches[DB_DBUF_CACHE].size));
 		DBUF_STAT_BUMP(cache_total_evicts);
-		mutex_enter(&os->os_ev_lock);
-		(void) atomic_cas_64(&os->os_ev_tid, tid, 0);
-		cv_broadcast(&os->os_ev_cv);
-		mutex_exit(&os->os_ev_lock);
 	} else {
 		multilist_sublist_unlock(mls);
 	}

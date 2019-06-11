@@ -624,9 +624,6 @@ dmu_objset_open_impl(spa_t *spa, dsl_dataset_t *ds, blkptr_t *bp,
 	os->os_obj_next_percpu = kmem_zalloc(os->os_obj_next_percpu_len *
 	    sizeof (os->os_obj_next_percpu[0]), KM_SLEEP);
 
-	mutex_init(&os->os_ev_lock, NULL, MUTEX_DEFAULT, NULL);
-	cv_init(&os->os_ev_cv, NULL, CV_DEFAULT, NULL);
-
 	dnode_special_open(os, &os->os_phys->os_meta_dnode,
 	    DMU_META_DNODE_OBJECT, &os->os_meta_dnode);
 	if (OBJSET_BUF_HAS_USERUSED(os->os_phys_buf)) {
@@ -933,20 +930,6 @@ dmu_objset_evict_dbufs(objset_t *os)
 void
 dmu_objset_evict(objset_t *os)
 {
-	/*
-	 * Coordinate objset eviction with dbuf eviction.  Signify
-	 * "ownership" of eviction in this objset by recording your
-	 * thread id onto the objset.
-	 */
-	uint64_t tid = (uint64_t)(uintptr_t)curthread;
-	(void) atomic_cas_64(&os->os_ev_tid, 0, tid);
-	mutex_enter(&os->os_ev_lock);
-	while (os->os_ev_tid != tid) {
-		cv_wait(&os->os_ev_cv, &os->os_ev_lock);
-		(void) atomic_cas_64(&os->os_ev_tid, 0, tid);
-	}
-	mutex_exit(&os->os_ev_lock);
-
 	dsl_dataset_t *ds = os->os_dsl_dataset;
 
 	for (int t = 0; t < TXG_SIZE; t++)
@@ -969,7 +952,7 @@ dmu_objset_evict(objset_t *os)
 		mutex_exit(&os->os_lock);
 	}
 
-	(void) atomic_cas_64(&os->os_ev_tid, tid, 0);
+
 }
 
 void
@@ -1005,8 +988,6 @@ dmu_objset_evict_done(objset_t *os)
 	mutex_destroy(&os->os_obj_lock);
 	mutex_destroy(&os->os_user_ptr_lock);
 	mutex_destroy(&os->os_upgrade_lock);
-	mutex_destroy(&os->os_ev_lock);
-	cv_destroy(&os->os_ev_cv);
 	for (int i = 0; i < TXG_SIZE; i++) {
 		multilist_destroy(os->os_dirty_dnodes[i]);
 	}

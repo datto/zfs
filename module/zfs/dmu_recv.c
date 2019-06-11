@@ -2694,9 +2694,10 @@ dmu_recv_end_check(void *arg, dmu_tx_t *tx)
 	} else {
 		error = dsl_dataset_snapshot_check_impl(drc->drc_ds,
 		    drc->drc_tosnap, tx, B_TRUE, 1, drc->drc_cred);
-		if (error == 0)
-			error = dsl_dataset_snapshot_reserve_space(drc->drc_ds,
-			    tx);
+		if (error != 0)
+			return (error);
+
+		error = dsl_dataset_snapshot_reserve_space(drc->drc_ds, tx);
 	}
 	return (error);
 }

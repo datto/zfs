@@ -442,6 +442,22 @@ dnode_evict_dbufs(dnode_t *dn)
 		mutex_enter(&db->db_mtx);
 		if (db->db_state != DB_EVICTING &&
 		    zfs_refcount_is_zero(&db->db_holds)) {
+
+                boolean_t evicting_other = (dbuf_find_evicting(dn->dn_objset,
+                    dn->dn_object, db->db_level, db->db_blkid, db) != NULL);
+                if (evicting_other) {
+                        cmn_err(CE_NOTE, "os %lld db %lld:%lld:%lld already evicting",
+                            (longlong_t)dmu_objset_id(dn->dn_objset),
+                            (longlong_t)dn->dn_object,
+                            (longlong_t)db->db_level,
+                            (longlong_t)db->db_blkid);
+			db->db_pending_evict = TRUE;
+                        mutex_exit(&db->db_mtx);
+                        db_next = AVL_NEXT(&dn->dn_dbufs, db);
+			continue;
+		}
+
+
 			db_marker->db_level = db->db_level;
 			db_marker->db_blkid = db->db_blkid;
 			db_marker->db_state = DB_SEARCH;
